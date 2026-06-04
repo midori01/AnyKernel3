@@ -381,28 +381,23 @@ flash_boot() {
         if [ "$magisk_patched" == 1 ]; then
           ui_print " " "Magisk detected! Patching kernel so reflashing Magisk is not necessary...";
           comp=$(magiskboot decompress kernel 2>&1 | grep -vE 'raw|zimage' | sed -n 's;.*\[\(.*\)\];\1;p');
-          (magiskboot split $kernel || magiskboot decompress $kernel kernel) >&2;
+          (magiskboot split $kernel || magiskboot decompress $kernel kernel) 2>/dev/null;
           if [ $? != 0 -a "$comp" ] && $comp --help 2>/dev/null; then
             echo "Attempting kernel unpack with busybox $comp..." >&2;
             $comp -dc $kernel > kernel;
           fi;
           # legacy SAR kernel string skip_initramfs -> want_initramfs
-          magiskboot hexpatch kernel 736B69705F696E697472616D6673 77616E745F696E697472616D6673 && needskernelpatch=1;
+          magiskboot hexpatch kernel 736B69705F696E697472616D6673 77616E745F696E697472616D6673;
           if [ "$(file_getprop $AKHOME/anykernel.sh do.modules)" == 1 ] && [ "$(file_getprop $AKHOME/anykernel.sh do.systemless)" == 1 ]; then
             strings kernel 2>/dev/null | grep -E -m1 'Linux version.*#' > $AKHOME/vertmp;
           fi;
-          if [ "$needskernelpatch" ]; then
-            if [ "$comp" ]; then
-              magiskboot compress=$comp kernel kernel.$comp;
-              if [ $? != 0 ] && $comp --help 2>/dev/null; then
-                echo "Attempting kernel repack with busybox $comp..." >&2;
-                $comp -9c kernel > kernel.$comp;
-              fi;
-              mv -f kernel.$comp kernel;
+          if [ "$comp" ]; then
+            magiskboot compress=$comp kernel kernel.$comp;
+            if [ $? != 0 ] && $comp --help 2>/dev/null; then
+              echo "Attempting kernel repack with busybox $comp..." >&2;
+              $comp -9c kernel > kernel.$comp;
             fi;
-          else
-            echo "Restoring untouched new kernel since no patching required..." >&2;
-            (magiskboot split -n $kernel || cp -f $kernel kernel) >&2;
+            mv -f kernel.$comp kernel;
           fi;
           [ ! -f .magisk ] && magiskboot cpio ramdisk.cpio "extract .backup/.magisk .magisk";
           export $(cat .magisk);
@@ -412,7 +407,7 @@ flash_boot() {
         elif [ -d /data/data/me.weishu.kernelsu ] && [ "$(file_getprop $AKHOME/anykernel.sh do.modules)" == 1 ] && [ "$(file_getprop $AKHOME/anykernel.sh do.systemless)" == 1 ]; then
           ui_print " " "KernelSU detected! Setting up for kernel helper module...";
           comp=$(magiskboot decompress kernel 2>&1 | grep -vE 'raw|zimage' | sed -n 's;.*\[\(.*\)\];\1;p');
-          (magiskboot split $kernel || magiskboot decompress $kernel kernel) >&2;
+          (magiskboot split $kernel || magiskboot decompress $kernel kernel) 2>/dev/null;
           if [ $? != 0 -a "$comp" ] && $comp --help 2>/dev/null; then
             echo "Attempting kernel unpack with busybox $comp..." >&2;
             $comp -dc $kernel > kernel;
@@ -992,7 +987,104 @@ setup_ak() {
   type ${name}_attributes >/dev/null 2>&1 && ${name}_attributes;
 }
 ###
+# Kernel version extraction function from kernel files (raw or compressed)
+# Returns only X.X.X-androidYY, discards everything else
+extract_kernel_version() {
+  local target="$1"
+  local ver_str tmpfile
+
+  # Attempt 1: raw (direct strings) - single grep extracts X.X.X-androidYY directly
+  ver_str=$(strings "$target" 2>/dev/null | grep -oE 'Linux version [0-9]+\.[0-9]+\.[0-9]+-android[0-9]+' -m1 | cut -d' ' -f3)
+
+  # Attempt 2: compressed kernel → magiskboot decompress then strings
+  if [ -z "$ver_str" ]; then
+    tmpfile="${target}_ak3decomp"
+    magiskboot decompress "$target" "$tmpfile" 2>/dev/null
+    if [ -f "$tmpfile" ]; then
+      ver_str=$(strings "$tmpfile" 2>/dev/null | grep -oE 'Linux version [0-9]+\.[0-9]+\.[0-9]+-android[0-9]+' -m1 | cut -d' ' -f3)
+      rm -f "$tmpfile"
+    fi
+  fi
+
+  echo "$ver_str"
+}
+
+# Version comparison: returns 0 if a >= b, 1 if a < b
+version_ge() {
+  local new=$1 dev=$2
+  local n1 n2 n3 d1 d2 d3
+  
+  # Fast-track for exact matches (5.15.180 == 5.15.180)
+  [ "$new" = "$dev" ] && return 0
+
+  # Split into segments
+  n1=$(echo "$new" | cut -d. -f1); n2=$(echo "$new" | cut -d. -f2); n3=$(echo "$new" | cut -d. -f3)
+  d1=$(echo "$dev" | cut -d. -f1); d2=$(echo "$dev" | cut -d. -f2); d3=$(echo "$dev" | cut -d. -f3)
+
+  # Check Major & Minor equality
+  if [ "$n1" != "$d1" ] || [ "$n2" != "$d2" ]; then
+    ui_print "  -> ERROR: Base version mismatch ($n1.$n2 vs $d1.$d2)"
+    return 1
+  fi
+
+  # Check Patch version (e.g., .185 >= .180)
+  if [ "$n3" -ge "$d3" ] 2>/dev/null; then
+    return 0
+  else
+    ui_print "  -> ERROR: Downgrade detected ($n3 < $d3)"
+    return 1
+  fi
+}
+
+# Kernel Version Check Function: Image vs. Kernel in Device
+do_check_boot_version() {
+  ui_print " " "  -> Check kernel version compatibility..."
+
+  # BYPASS: do.check_boot_version=0 in anykernel.sh skips check
+  if [ "$(file_getprop anykernel.sh do.check_boot_version)" != 1 ]; then
+    ui_print "  -> [BYPASS] do.check_boot_version=0: version check SKIPPED."
+    ui_print "  -> [BYPASS] Forced flash. Proceed with caution!"
+    return 1
+  fi
+
+  local new_ver dev_ver new_kver new_abranch dev_kver dev_abranch
+
+  # Version from Image file (new kernel to flash)
+  new_ver=$(extract_kernel_version "$AKHOME/Image")
+  if [ -z "$new_ver" ]; then
+    abort "  -> ERROR: Unable to read version from Image. Abort."
+  fi
+
+  # Version from device boot partition (target slot, direct read via $BLOCK)
+  dev_ver=$(extract_kernel_version "$BLOCK")
+  if [ -z "$dev_ver" ]; then
+    abort "  -> ERROR: Unable to read version from device boot partition. Abort."
+  fi
+
+  # Split X.X.X and androidYY
+  new_kver=$(echo "$new_ver" | cut -d- -f1)
+  new_abranch=$(echo "$new_ver" | cut -d- -f2)
+  dev_kver=$(echo "$dev_ver" | cut -d- -f1)
+  dev_abranch=$(echo "$dev_ver" | cut -d- -f2)
+
+  ui_print "  -> Image  : $new_ver"
+  ui_print "  -> Device : $dev_ver"
+
+  # Check 1: android branch must be exactly equal
+  if [ "$new_abranch" != "$dev_abranch" ]; then
+    abort "  -> MISMATCH Android branch: Image=$new_abranch | Device=$dev_abranch. Abort."
+  fi
+
+  # Check 2: kernel version Image must be >= Device
+  if ! version_ge "$new_kver" "$dev_kver"; then
+    abort "  -> MISMATCH Kernel version: Image=$new_kver < Device=$dev_kver. Abort."
+  fi
+
+  ui_print "  -> Kernel version: COMPATIBLE ($new_ver >= $dev_ver)"
+}
 
 ### end methods
 
 setup_ak;
+
+do_check_boot_version;
